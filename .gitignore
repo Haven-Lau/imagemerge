@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# Except this folder
+!run/
+!run/**
+
+# Allow the .gitignore file itself
+!.gitignore

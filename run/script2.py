@@ -1,8 +1,17 @@
 import streamlit as st
 import numpy as np
 import cv2
+import tempfile
+import os
+import hashlib
 from PIL import Image, ImageGrab
 from io import BytesIO
+
+def get_file_hash(file):
+    file.seek(0)
+    content = file.read()
+    file.seek(0)
+    return hashlib.md5(content).hexdigest()
 
 st.set_page_config(page_title="🧵 Vertical Screenshot Stitcher", layout="wide")
 st.title("🧵 Vertical Screenshot Stitcher")
@@ -14,7 +23,7 @@ if "images" not in st.session_state:
 if "stitched_result" not in st.session_state:
     st.session_state.stitched_result = None
 if "uploaded_filenames" not in st.session_state:
-    st.session_state.uploaded_filenames = set()
+    st.session_state.uploaded_filenames = []
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
@@ -36,11 +45,186 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True, key=st.session_state.uploader_key
 )
 if uploaded_files:
-    for file in uploaded_files:
-        if file.name not in st.session_state.uploaded_filenames:
-            img = Image.open(file).convert("RGB")
-            st.session_state.images.append(img)
-            st.session_state.uploaded_filenames.add(file.name)
+    new_files = [
+        (file.name, Image.open(file).convert("RGB"))
+        for file in uploaded_files
+        if file.name not in st.session_state.uploaded_filenames
+    ]
+
+    # Sort new files by filename
+    new_files.sort(key=lambda x: x[0])
+
+    # Extend session state
+    st.session_state.uploaded_filenames.extend([name for name, _ in new_files])
+    st.session_state.images.extend([img for _, img in new_files])
+
+# --- VIDEO UPLOAD + CONTROLS ---
+st.subheader("🎥 Upload a Video for Frame Extraction")
+video_file = st.file_uploader("Upload a video file", type=["mp4", "avi", "mov", "mkv"], label_visibility="collapsed")
+
+# Cache the temp file path using session_state
+if video_file is not None:
+    video_hash = get_file_hash(video_file)
+
+    if "video_hash" not in st.session_state or st.session_state.video_hash != video_hash:
+        # Clean up old temp file
+        if "video_temp_path" in st.session_state:
+            try:
+                os.unlink(st.session_state.video_temp_path)
+            except Exception as e:
+                st.warning(f"Could not delete previous temp video file: {e}")
+
+        # Create new temp file
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tfile.write(video_file.read())
+        tfile.close()
+
+        # Store path and hash
+        st.session_state.video_temp_path = tfile.name
+        st.session_state.video_hash = video_hash
+
+    video_path = st.session_state.video_temp_path
+    cap = cv2.VideoCapture(video_path)
+
+    if not cap.isOpened():
+        st.error("❌ Failed to open video.")
+    else:
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        duration = total_frames / fps
+
+        #st.video(video_path)
+        st.markdown(f"**Video Info:** 🧮 {total_frames} frames &nbsp;&nbsp; 🎞 {fps:.2f} FPS &nbsp;&nbsp; ⏱ {duration:.2f} seconds")
+
+        # --- Initialize State ---
+        if "start_frame" not in st.session_state:
+            st.session_state.start_frame = 0
+        if "end_frame" not in st.session_state:
+            st.session_state.end_frame = total_frames - 1
+        if "selected_time" not in st.session_state:
+            st.session_state.selected_time = 0.0
+
+        # --- Timestamp slider + manual time input ---
+        st.markdown("### 🕹 Select Timestamp")
+
+        col_slider, col_time = st.columns([3, 1])
+        with col_slider:
+            selected_time = st.slider(
+                "🕹 Select timestamp (seconds)", 0.0, duration,
+                float(st.session_state.selected_time), step=0.1,
+                label_visibility="collapsed"
+            )
+
+        with col_time:
+            # Extract current time components
+            total_ms = int(selected_time * 1000)
+            current_minutes = total_ms // 60000
+            current_seconds = (total_ms % 60000) // 1000
+            current_milliseconds = total_ms % 1000
+
+            col_min, col_sec, col_ms = st.columns(3)
+            minutes_input = col_min.number_input(
+                "Min", min_value=0, max_value=int(duration)//60,
+                value=current_minutes, step=1, key="min_input"
+            )
+            seconds_input = col_sec.number_input(
+                "Sec", min_value=0, max_value=59,
+                value=current_seconds, step=1, key="sec_input"
+            )
+            ms_input = col_ms.number_input(
+                "Ms", min_value=0, max_value=999,
+                value=current_milliseconds, step=1, key="ms_input"
+            )
+
+        # Compute total time from manual input
+        manual_time = minutes_input * 60 + seconds_input + (ms_input / 1000)
+        manual_time = min(manual_time, duration)
+
+        # Sync: If manual time and slider time differ, update the session state
+        if abs(manual_time - st.session_state.selected_time) > 0.1:
+            st.session_state.selected_time = manual_time
+            st.rerun()
+
+        selected_time = manual_time
+        selected_frame = int(selected_time * fps)
+
+        # --- Show Time Info ---
+        minutes = int(selected_time) // 60
+        seconds = int(selected_time) % 60
+        st.write(f"🧷 Current Frame Index: {selected_frame} | 🕒 {selected_time:.1f}s ({minutes}:{seconds:02d})")
+
+        # --- Show preview frame ---
+        cap.set(cv2.CAP_PROP_POS_FRAMES, selected_frame)
+        ret, frame = cap.read()
+        if ret:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            st.image(frame_rgb, caption=f"Preview at Frame {selected_frame}", use_container_width=False)
+        else:
+            st.warning("⚠️ Failed to extract preview frame.")
+
+        # --- Frame jump controls ---
+        st.markdown("### 🔁 Frame Jump")
+        jump_amount = st.slider("Jump Forward/Backward by N frames", 1, 100, 10)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("⏩ Jump Forward"):
+                new_time = min(selected_time + (jump_amount / fps), duration)
+                st.session_state.selected_time = new_time
+                st.rerun()
+        with col2:
+            if st.button("⏪ Jump Backward"):
+                new_time = max(selected_time - (jump_amount / fps), 0.0)
+                st.session_state.selected_time = new_time
+                st.rerun()
+
+        # --- Set start/end from current frame ---
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📍 Set Current as Start Frame"):
+                st.session_state.start_frame = selected_frame
+        with col2:
+            if st.button("🎯 Set Current as End Frame"):
+                st.session_state.end_frame = selected_frame
+
+        # --- Manual Start/End Frame Inputs ---
+        st.markdown("### 🎞 Frame Range Selection")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.start_frame = st.number_input("Start Frame", min_value=0, max_value=total_frames-1,
+                                                           value=st.session_state.start_frame, step=1)
+        with col2:
+            st.session_state.end_frame = st.number_input("End Frame", min_value=0, max_value=total_frames-1,
+                                                         value=st.session_state.end_frame, step=1)
+
+        # --- Sampling Slider ---
+        sampling_step = st.slider("🧮 Sampling Step (Use every X-th frame)", min_value=1, max_value=50, value=1)
+        st.markdown(f"📊 Effective frames selected: **{len(range(st.session_state.start_frame, st.session_state.end_frame + 1, sampling_step))}**")
+
+        if st.button("🎞 Extract Frames from Range"):
+            st.info("⏳ Extracting frames...")
+            cap.set(cv2.CAP_PROP_POS_FRAMES, st.session_state.start_frame)
+            current_frame = st.session_state.start_frame
+            frames_to_add = []
+
+            while current_frame <= st.session_state.end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if (current_frame - st.session_state.start_frame) % sampling_step == 0:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_img = Image.fromarray(rgb)
+                    frames_to_add.append(pil_img)
+                current_frame += 1
+
+            cap.release()  # release before unlink
+            try:
+                os.unlink(video_path)
+            except Exception as e:
+                st.warning(f"Could not delete temporary video file: {e}")
+
+            st.session_state.images.extend(frames_to_add)
+            st.success(f"✅ Added {len(frames_to_add)} frames.")
+
 
 # Clear all
 if st.button("🗑 Clear All Images"):
@@ -86,11 +270,19 @@ def stitch_images(images, gradient_overlay=False, enable_zoom=False):
         gray1 = cv2.cvtColor(stitched, cv2.COLOR_BGR2GRAY)
         gray2_unscaled = cv2.cvtColor(original_next_img, cv2.COLOR_BGR2GRAY)
 
-        orb = cv2.ORB_create(1000)
+        # orb = cv2.ORB_create(
+        #     nfeatures=10000,       # More keypoints
+        #     scaleFactor=1.2,       # Finer pyramid levels
+        #     edgeThreshold=5,       # Detect features closer to image edges
+        #     patchSize=31,          # Default patch size
+        #     fastThreshold=4        # Lower = more sensitive to low contrast
+        # )
+        orb = cv2.ORB_create(nfeatures=5000)
         kp1_unscaled, des1_unscaled = orb.detectAndCompute(gray1, None)
         kp2_unscaled, des2_unscaled = orb.detectAndCompute(gray2_unscaled, None)
 
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+        
         matches_unscaled = bf.match(des1_unscaled, des2_unscaled)
         matches_unscaled = sorted(matches_unscaled, key=lambda x: x.distance)
 
@@ -121,6 +313,22 @@ def stitch_images(images, gradient_overlay=False, enable_zoom=False):
 
         matches = bf.match(des1, des2)
         matches = sorted(matches, key=lambda x: x.distance)
+
+        # Rotation-consistent matching
+        rotation_threshold = 5  # degrees
+        rotation_consistent_matches = []
+
+        for m in matches:
+            angle1 = kp1[m.queryIdx].angle
+            angle2 = kp2[m.trainIdx].angle
+            angle_diff = abs(angle1 - angle2) % 360
+            angle_diff = min(angle_diff, 360 - angle_diff)  # shortest angle distance
+
+            if angle_diff <= rotation_threshold:
+                rotation_consistent_matches.append(m)
+
+        matches = rotation_consistent_matches
+
 
         match_debug = cv2.drawMatches(stitched, kp1, next_img, kp2, matches[:30], None, flags=2)
         st.image(cv2.cvtColor(match_debug, cv2.COLOR_BGR2RGB), caption=f"Top 30 Matches for Image {idx+1}", use_container_width=False)
@@ -155,26 +363,59 @@ def stitch_images(images, gradient_overlay=False, enable_zoom=False):
 
         # Place or blend new image
         x2, y2 = next_canvas_offset.astype(int)
-        if gradient_overlay and 0 <= y2 - y1 < h1 and 0 <= x2 - x1 < w1:
-            blend_h = min(h1 - (y2 - y1), h2)
-            blend_w = min(w1 - (x2 - x1), w2)
+        if gradient_overlay:
+            # Calculate overlap between stitched and next image on the canvas
+            x_overlap_start = max(x1, x2)
+            y_overlap_start = max(y1, y2)
+            x_overlap_end = min(x1 + w1, x2 + w2)
+            y_overlap_end = min(y1 + h1, y2 + h2)
 
-            alpha = np.linspace(1, 0, blend_h).reshape(-1, 1)
-            alpha = np.repeat(alpha, blend_w, axis=1)
-            alpha = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
+            if x_overlap_start < x_overlap_end and y_overlap_start < y_overlap_end:
+                ow = x_overlap_end - x_overlap_start
+                oh = y_overlap_end - y_overlap_start
 
-            blended = (
-                alpha * canvas[y2:y2 + blend_h, x2:x2 + blend_w].astype(np.float32) +
-                (1 - alpha) * next_img[:blend_h, :blend_w].astype(np.float32)
-            ).astype(np.uint8)
+                # Get regions to blend
+                stitched_crop = canvas[y_overlap_start:y_overlap_start + oh, x_overlap_start:x_overlap_start + ow].astype(np.float32)
+                next_crop = next_img[y_overlap_start - y2:y_overlap_start - y2 + oh,
+                                     x_overlap_start - x2:x_overlap_start - x2 + ow].astype(np.float32)
 
-            canvas[y2:y2 + blend_h, x2:x2 + blend_w] = blended
-            if blend_h < h2:
-                canvas[y2 + blend_h:y2 + h2, x2:x2 + blend_w] = next_img[blend_h:, :blend_w]
-            if blend_w < w2:
-                canvas[y2:y2 + h2, x2 + blend_w:x2 + w2] = next_img[:h2, blend_w:]
-        else:
-            canvas[y2:y2 + h2, x2:x2 + w2] = next_img
+                # Vertical gradient alpha
+                # If second image is below the stitched image, blend from stitched (top) to next (bottom)
+                if dy >= 0:
+                    alpha = np.linspace(1, 0, oh).reshape(-1, 1)
+                else:
+                    # If second image is above the stitched image, blend from stitched (bottom) to next (top)
+                    alpha = np.linspace(0, 1, oh).reshape(-1, 1)
+
+                alpha = np.repeat(alpha, ow, axis=1)
+                alpha = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
+
+                blended = (alpha * stitched_crop + (1 - alpha) * next_crop).astype(np.uint8)
+                canvas[y_overlap_start:y_overlap_start + oh, x_overlap_start:x_overlap_start + ow] = blended
+
+                # Paste remaining non-overlapping regions
+                # Top part (if any)
+                top_h = y_overlap_start - y2
+                if top_h > 0:
+                    canvas[y2:y2 + top_h, x2:x2 + w2] = next_img[:top_h, :]
+
+                # Bottom part
+                bottom_start = y_overlap_start - y2 + oh
+                if bottom_start < h2:
+                    canvas[y2 + bottom_start:y2 + h2, x2:x2 + w2] = next_img[bottom_start:, :]
+
+                # Left and right parts
+                left_w = x_overlap_start - x2
+                right_start = x_overlap_end - x2
+
+                if left_w > 0:
+                    canvas[y2:y2 + h2, x2:x2 + left_w] = next_img[:, :left_w]
+                if right_start < w2:
+                    canvas[y2:y2 + h2, x2 + right_start:x2 + w2] = next_img[:, right_start:]
+            else:
+                # No overlap, just paste
+                canvas[y2:y2 + h2, x2:x2 + w2] = next_img
+
 
         stitched = canvas
         stitched_offset = new_topleft
